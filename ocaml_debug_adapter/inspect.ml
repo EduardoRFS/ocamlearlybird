@@ -189,17 +189,20 @@ module Make (Args : sig
     );%lwt
     Lwt.return (BatOption.get !ret)
 
-  let rec eval_path (path : Path.t) =
-    match path with
-    | Pident id ->
+  let rec eval_address address =
+    match address with
+    | Env.Aident id ->
       let pos = Symbols.get_global_position symbols id in
       Remote_value.global conn pos
-    | Pdot (root, _field_name, pos) ->
-      let%lwt root = eval_path root in
+    | Env.Adot (root, pos) ->
+      let%lwt root = eval_address root in
       if not (Remote_value.is_block root)
       then raise Not_found
       else Remote_value.field conn root pos
-    | Papply _ -> assert%lwt false
+
+  let eval_path env path =
+    let address = Env.find_value_address path env in
+    eval_address address
 
   let publish_var ?(scope=false) var =
     Hashtbl.replace var_by_handle var.var_handle var;
@@ -273,7 +276,7 @@ module Make (Args : sig
     BatList.find_opt (fun (test, _) -> test env ty) var_makers |> BatOption.map snd
 
   let abstract_type =
-    Ctype.newty (Tconstr (Pident (Ident.create "abstract"), [], ref Types.Mnil))
+    Ctype.newty (Tconstr (Pident (Ident.create_local "abstract"), [], ref Types.Mnil))
 
   let rec make_value_var name env ty rv =
     match find_var_maker env ty with
@@ -414,7 +417,7 @@ module Make (Args : sig
                 )
               | {type_kind = Type_record(lbl_list, rep); _} ->
                 let unboxed = match rep with Record_unboxed _ -> true  | _ -> false in
-                let pos = match rep with Record_extension -> 1 | _ -> 0 in
+                let pos = match rep with Record_extension _ -> 1 | _ -> 0 in
                 Lwt.return (make_var name "<record>" (Some (fun () ->
                   make_record_fields_vars env path decl.type_params ty_args lbl_list pos rv unboxed
                 )))
@@ -548,7 +551,7 @@ module Make (Args : sig
             let%lwt vars = vars in
             let%lwt var =
               try%lwt
-                let%lwt rv = eval_path path in
+                let%lwt rv = eval_path env path in
                 make_value_var name env vd.val_type rv
               with _ ->
                 Lwt.return (make_var name "<uninitialized>" None)
