@@ -4,7 +4,6 @@ open Debug_adapter_protocol
 open Debug_protocol
 open Debug_protocol_ex
 open Signatures
-
 module Make (Args : sig
     val rpc : Rpc.t
     val replace_agent : (module AGENT) -> unit
@@ -189,17 +188,20 @@ module Make (Args : sig
     );%lwt
     Lwt.return (BatOption.get !ret)
 
-  let rec eval_path (path : Path.t) =
-    match path with
-    | Pident id ->
+  let rec eval_address address =
+    match address with
+    | Env.Aident id ->
       let pos = Symbols.get_global_position symbols id in
       Remote_value.global conn pos
-    | Pdot (root, _field_name, pos) ->
-      let%lwt root = eval_path root in
+    | Env.Adot (root, pos) ->
+      let%lwt root = eval_address root in
       if not (Remote_value.is_block root)
       then raise Not_found
       else Remote_value.field conn root pos
-    | Papply _ -> assert%lwt false
+
+  let eval_path env path =
+    let address = Env.find_value_address path env in
+    eval_address address
 
   let publish_var ?(scope=false) var =
     Hashtbl.replace var_by_handle var.var_handle var;
@@ -273,7 +275,7 @@ module Make (Args : sig
     BatList.find_opt (fun (test, _) -> test env ty) var_makers |> BatOption.map snd
 
   let abstract_type =
-    Ctype.newty (Tconstr (Pident (Ident.create "abstract"), [], ref Types.Mnil))
+    Ctype.newty (Tconstr (Pident (Ident.create_local "abstract"), [], ref Types.Mnil))
 
   let rec make_value_var name env ty rv =
     match find_var_maker env ty with
@@ -414,7 +416,7 @@ module Make (Args : sig
                 )
               | {type_kind = Type_record(lbl_list, rep); _} ->
                 let unboxed = match rep with Record_unboxed _ -> true  | _ -> false in
-                let pos = match rep with Record_extension -> 1 | _ -> 0 in
+                let pos = match rep with Record_extension _ -> 1 | _ -> 0 in
                 Lwt.return (make_var name "<record>" (Some (fun () ->
                   make_record_fields_vars env path decl.type_params ty_args lbl_list pos rv unboxed
                 )))
@@ -428,7 +430,7 @@ module Make (Args : sig
                   let%lwt ident = Remote_value.obj conn ident in
                   let lid = Longident.parse ident in
                   try%lwt
-                    let cstr = Env.lookup_constructor lid env in
+                    let cstr = Env.find_constructor_by_name lid env in
                     (* let path = match cstr.cstr_tag with Cstr_extension (p, _) -> p | _ -> raise Not_found in
                        let%lwt slot' = eval_path path in
                        if not (Remote_value.same slot slot') then raise Not_found; *)
@@ -528,7 +530,7 @@ module Make (Args : sig
       |> Ident.Map.bindings
       |> Lwt_list.filter_map_s (fun (ident, _) ->
         let name = Ident.name ident in
-        match Env.lookup_value (Longident.Lident name) env with
+        match Env.find_value_by_name (Longident.Lident name) env with
         | exception Not_found -> Lwt.return_none
         | (_, valdesc) ->
           let ty = Ctype.correct_levels valdesc.Types.val_type in
@@ -539,22 +541,44 @@ module Make (Args : sig
       )
     ))
 
+  let fold_values f lid env initial =
+    let open Types in
+    let open Path in
+    let (module_path, module_declaration) = Env.find_module_by_name lid env in
+    let rec get_all_module_paths_from_module md =
+      match md.md_type with
+      | Mty_ident _ | Mty_functor _ | Mty_alias _ -> []
+      | Mty_signature signature -> 
+        let get_path_and_value_descriptor =
+          function
+          | Sig_value (ident, vd, _) ->
+            let name = Ident.name ident in
+            let path = Pdot(module_path, name) in
+            [(name, path, vd)]
+          | Sig_module (_, _, module_declaration, _, _) ->
+              get_all_module_paths_from_module module_declaration
+          | _ -> [] in
+        signature
+        |> List.concat_map get_path_and_value_descriptor in
+    get_all_module_paths_from_module module_declaration
+    |> List.fold_left (fun acc -> fun (name, path, vd) -> f name path vd acc) initial
+
   let make_global_var (ev : Instruct.debug_event) =
     let env = Envaux.env_from_summary ev.ev_typenv ev.ev_typsubst in
     make_var "global" "" (Some (fun () ->
       Lwt_list.map_s (fun (mi : Symbols.debug_module_info) ->
         Lwt.return (make_var mi.name "<module>" (Some (fun () ->
-          Env.fold_values (fun name path vd vars ->
+          fold_values (fun name path vd vars ->
             let%lwt vars = vars in
             let%lwt var =
               try%lwt
-                let%lwt rv = eval_path path in
+                let%lwt rv = eval_path env path in
                 make_value_var name env vd.val_type rv
               with _ ->
                 Lwt.return (make_var name "<uninitialized>" None)
             in
             Lwt.return (var :: vars)
-          ) (Some (Longident.parse mi.name)) env (Lwt.return_nil)
+          ) (Longident.parse mi.name) env (Lwt.return_nil)
         )))
       ) (Symbols.module_infos symbols)
     ))

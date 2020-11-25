@@ -119,7 +119,8 @@ module Make (Args : sig
         let%lwt conn = promise in
         let%lwt pid = Debug_conn.initial conn in
         (* TODO: Move these code to suitable place *)
-        Config.load_path := Symbols.all_dirs symbols;
+
+        Load_path.init (Symbols.all_dirs symbols);
         Envaux.reset_cache ();
         replace_agent (module Agent_launched_debug.Make (struct
             include Args
